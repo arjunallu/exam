@@ -1,0 +1,183 @@
+In this series where we have taken a ground-up approach to build, test and deploy a microservice to the cloud in an automated manner. Here’s what we have covered so far in this series:
+steps:
+         1.Getting Started With GitHub Actions
+         2.Building & Publishing A JAR
+         3.Running Tests & Publishing Test Reports
+         4. Deploying A Microservice to the Cloud With GitHub Actions[OCI CLI Edition]
+         5. Deploying A Microservice to the Cloud With GitHub Actions [Gradle Plugin Edition]
+         6.Adding A Persistence Tier To Our Microservice
+         7.Testing The Persistence Tier With Testcontainers
+         8.Deploying A Microservice With A Tested Persistence Tier In Place
+         9.Deploying A Microservice As A Docker Container
+in this final , we’re going to deploy our Docker container that contains our microservice application to a Kubernetes cluster in the  Cloud.
+You probably already have a Kubernetes cluster configured in your cloud environment, but if not here are a few resources to help you get one up and running quickly.
+
+Create A Service Account :
+Before we can use kubectl in our pipeline, we need to configure a service account on our Kubernetes cluster so that our GitHub Actions pipeline has the proper authority to issue commands to our cluster.
+STEP 1:
+           Create the service account that uses the name cicd-demo and a cluster role binding for that service account.
+          $ kubectl -n kube-system create serviceaccount cicd-demo
+          $ kubectl create clusterrolebinding cicd-demo-binding --clusterrole=cluster-admin --serviceaccount=kube-system:cicd-demo
+STEP 2:
+            Grab the name of the token that was created for the service account, then get the token.
+            $ TOKENNAME=`kubectl -n kube-system get serviceaccount/cicd-demo -o jsonpath='{.secrets[0].name}'`
+            $ TOKEN=`kubectl -n kube-system get secret $TOKENNAME -o jsonpath='{.data.token}'| base64 --decode`
+STEP 3:
+            On your local machine, add the service account and token to your local config file by executing.
+            $ kubectl config set-credentials cicd-demo --token=$TOKEN     
+STEP 4:
+           Set the current context to be the service account user we created in step 1. You can change this later on, but it is important that this is done before step
+           $ kubectl config set-context —current --user=cicd-demo
+STEP 5:
+           Export a base64 representation of your local kube config and copy to your clipboard.
+           $ more ~/.kube/config | base64 | pbcopy
+STEP 6:  
+           Create a GitHub secret containing the base64 representation of your config.
+We can now start using the kubectl GitHub Action in our pipeline to work with our OKE cluster!
+
+Create Kubernetes Deployment Configuration:
+The first thing we’re going to need to create is a deployment configuration for our microservice. This involves two things: an app.yaml to define our deployment and the associated service and a secret containing our DB password. 
+If you’ve been following along with this series you know that we’ve already got that secret in our GitHub repository (we created it in part 8) so we just need to create our secret in our cluster from that value.
+
+Create A Secret:
+
+Let’s add a step to our build to create the secret. We can do this directly via kubectl without writing a config file, so add a step to do 
+- name: 'Create Password Secret'
+  uses: steebchen/kubectl@master
+  env:
+    KUBE_CONFIG_DATA: ${{ secrets.OKE_KUBE_CONFIG }}
+  with:
+    args: "create secret generic cicd-demo-secrets --from-literal=dbPassword='${{secrets.OKE_DB_PASSWORD}}' --save-config --dry-run -o yaml | kubectl apply -f -"
+
+Create Deployment YAML:
+Next, create a file at k8s/app.yaml relative to your project root and populate it with the service and deployment definition.Make sure that the image value points to the proper location where your Docker image is being stored.
+Notice that we’re using an imagePullPolicy of Always which means regardless of your tag on your Docker image, Kubernetes will always pull a new version instead of using a locally cached image.If you’re new to Kubernetes,
+make sure you create a secret containing your registry credentials and use that as your imagePullSecrets value.
+
+kind: Service
+apiVersion: v1
+metadata:
+  name: cicd-demo
+  labels:
+    app: cicd-demo
+spec:
+  type: LoadBalancer
+  selector:
+    app: cicd-demo
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: 8080
+---
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  name: cicd-demo
+  labels:
+    app: cicd-demo
+    version: v1
+spec:
+  selector:
+    matchLabels:
+      app: cicd-demo
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: cicd-demo
+        version: v1
+    spec:
+      containers:
+      - name: cicd-demo
+        image: phx.ocir.io/toddrsharp/cicd-demo/cicd-demo:latest
+        env:
+        - name: DATASOURCE_URL
+          value: jdbc:oracle:thin:@[TNS NAME]?TNS_ADMIN=/wallet
+        - name: DATASOURCE_USERNAME
+          value: [DB Username]
+        - name: DATASOURCE_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: cicd-demo-secrets
+              key: dbPassword
+        imagePullPolicy: Always
+        ports:
+          - containerPort: 8080
+      imagePullSecrets:
+        - name: regcred
+---
+
+Add Deployment :
+Now let’s add a step to our pipeline to perform the deployment.
+- name: 'Deploy To Kubernetes'
+  uses: steebchen/kubectl@master
+  env:
+    KUBE_CONFIG_DATA: ${{ secrets.OKE_KUBE_CONFIG }}
+  with:
+    args: '"apply -f ./k8s/app.yaml"'
+
+Kill Existing Pod:
+Finally, add a step to grab the most recent Pod in this deployment and kill it. This will ensure that our deployment is running the latest and greatest Docker image that was pushed to OCIR during this build.
+- name: 'Kill Pod'
+  uses: steebchen/kubectl@master
+  env:
+    KUBE_CONFIG_DATA: ${{ secrets.OKE_KUBE_CONFIG }}
+  with:
+    args: '"delete pod $(kubectl get pod -l app=cicd-demo -o jsonpath="{.items[0].metadata.name}")"'
+
+The Final Build
+Once we commit and push our latest changes we can observe the final build in this blog series and confirm that it completed successfully.
+
+And confirm by POSTing a new user:
+$ curl -s \
+    -H "Content-Type: application/json” \
+    -X POST \
+    -d '{"firstName":"todd", "lastName":"sharp", "email":"me@ohmy.com", "age":42}’    
+    http://129.146.214.93:/hello/ | jq
+{
+  "id": "bfcb6c09-46c0-40ec-bad6-ab826635f6e5",
+  "firstName": "todd",
+  "lastName": "sharp",
+  "age": 42,
+  "email": "me@ohmy.com"
+}
+
+
+7 Ways to Prepare for a Seamless Deployment From Development to Production
+ STEPS: 
+1. Ensure the App Works in a Staging Environment :
+      Before deploying an app to production, make sure it’s working properly beyond just on your machine. Take the time to test your app in a staging environment before progressing further to ensure it functions as intended. 
+       A staging environment is “a complete copy of the production environment (hardware and software), independent and similar in terms of location and database load.” There are a variety of different types, 
+       each with a specific purpose. Consider whether a quality assurance (QA) or user acceptance testing [UAT] space best fits the needs of your development project.
+
+ 2.  Automate the Tests You Run For QA:
+         Once you set up the staging environment, run a full scope of automated functional tests to verify that the application works correctly. 
+         Some examples of automated functional tests include:
+          Smoke tests: Preliminary testing to reveal simple failures severe enough to reject a prospective software release
+          Regression tests: Re-running functional and non-functional tests to ensure the software that’s been previously developed and tested still performs correctly after a change
+          End-to-end tests: Verifying that applications communicate correctly with other services.
+
+ 3. Set Up a Monitoring System:
+         Monitoring the app’s performance is the next step to ensuring you’ll be able to quickly isolate any problems  Usage of CPU
+Memory (RAM) Usage
+Left Disk Space
+Number of Requests Per Second
+Response Times of Services.          
+
+4. Start with a Canary Release:
+       Before rolling out the new version of the software to the entire user base, launch the change to a small subset of users. 
+       Named after the mining practice of using birds of the same name to detect poisonous gasses that could impact workers, a canary release to a limited subset “detects potential bugs and disruption without affecting every other system running.”
+
+5. Rollback Quickly if Required:
+       You’ve been working on the new software version for months. Everything has been thoroughly tested, monitored, and works in the staging environment… so everything should go smoothly, right?
+
+6. React to Critical Errors As Soon As Possible:
+     For critical failures, a rollback is a quick but only temporary fix. You should always be able to react to critical errors in just minutes, or at most, within hours. Time the release far away from off periods like long weekends so staff will be on duty to make fixes if needed.
+     Major fixes usually require more workforce and a few dedicated days to debug and resolve. Truthfully, no matter how well prepared you are for production, failures can always occur. 
+
+7. Set Up Open Communication Channels :
+      Identify the parties your product release will affect the most and how you plan to communicate with them. If the system is actively on fire, you won’t have the time to figure out the support email address or the name of the developer responsible for resolving issues.
+      Agree on the dedicated communication channels with a client and end-users in advance. Keep everyone in the loop about what went wrong, the temporary solution, and when you expect to have it solved. 
+                  
+          
